@@ -1,0 +1,20 @@
+swayam:
+  url: "https://swayam.gov.in/"
+  course_name: "Project Management for Managers"
+
+llm:
+  provider: "nvidia"  # "nvidia" or "groq"
+  groq_model: "llama-3.3-70b-versatile"
+  nvidia_model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+
+output:
+  base_dir: "output"
+  save_audio: true      # Set false to skip saving audio files
+  save_transcript: true  # Set false to skip saving transcripts
+
+selenium:
+  wait_timeout: 20
+  login_timeout: 120    # seconds to wait for manual login
+
+transcription:
+  chunk_length_ms: 600000  # 10 minutes per chunk
