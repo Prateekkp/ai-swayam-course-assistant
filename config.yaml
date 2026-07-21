@@ -1,6 +1,6 @@
 swayam:
   url: "https://swayam.gov.in/"
-  course_name: "Project Management for Managers"
+  course_name: "Project Management for Managers" # Course name to download
 
 llm:
   provider: "nvidia"  # "nvidia" or "groq"
