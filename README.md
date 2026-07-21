@@ -84,7 +84,7 @@ swayam:
   course_name: "Project Management for Managers"  # Exact course name
 
 llm:
-  provider: "groq"  # "groq" or "nvidia"
+  provider: "nvidia"  # "groq" or "nvidia"
   groq_model: "llama-3.3-70b-versatile"
   nvidia_model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 
