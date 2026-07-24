@@ -200,36 +200,69 @@ class SWAYAMBrowser:
         print(f"  Found {len(items)} lessons")
         return items
 
+    def _ensure_default_content(self):
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    def _wait_for_idle(self):
+        try:
+            for _ in range(10):
+                state = self.driver.execute_script("return document.readyState")
+                if state == "complete":
+                    return
+                time.sleep(1)
+        except Exception:
+            pass
+
     def click_lesson(self, lesson_name: str):
         print(f"    Opening lesson: {lesson_name}")
+        self._ensure_default_content()
+        time.sleep(2)
 
-        item = self.wait.until(
-            EC.element_to_be_clickable(
-                (By.XPATH,
-                 f"//button[.//p[normalize-space()='{lesson_name}']]")
-            )
-        )
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({block:'center'});", item
-        )
-        item.click()
+        found = self.driver.execute_script("""
+            const name = arguments[0];
+            for (const btn of document.querySelectorAll('button')) {
+                const p = btn.querySelector('p');
+                if (p && p.textContent.trim() === name) {
+                    btn.scrollIntoView({block:'center'});
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        """, lesson_name)
+
+        if not found:
+            raise Exception(f"Lesson button not found: {lesson_name}")
+
+        time.sleep(5)
 
     def get_youtube_link(self) -> str | None:
         try:
-            iframe = WebDriverWait(self.driver, 5).until(
-                EC.presence_of_element_located((By.TAG_NAME, "iframe"))
+            link = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "a.ytmVideoInfoVideoTitle[href*='youtube.com/watch']"
             )
-            self.driver.switch_to.frame(iframe)
+            if link:
+                return link[0].get_attribute("href")
 
-            youtube = self.wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//a[contains(@href,'youtube.com/watch')]")
-                )
-            )
-            href = youtube.get_attribute("href")
+            iframe = self.driver.find_elements(By.TAG_NAME, "iframe")
+            if iframe:
+                self.driver.switch_to.frame(iframe[0])
+                time.sleep(2)
+                try:
+                    yt = self.driver.find_elements(
+                        By.XPATH, "//a[contains(@href,'youtube.com/watch')]"
+                    )
+                    if yt:
+                        return yt[0].get_attribute("href")
+                finally:
+                    self._ensure_default_content()
 
-            self.driver.switch_to.default_content()
-            return href
-        except TimeoutException:
-            self.driver.switch_to.default_content()
             return None
+        except Exception:
+            return None
+        finally:
+            self._ensure_default_content()
