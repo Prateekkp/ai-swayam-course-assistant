@@ -9,12 +9,16 @@ llm:
 
 output:
   base_dir: "output"
-  save_audio: true      # Set false to skip saving audio files
   save_transcript: true  # Set false to skip saving transcripts
 
 selenium:
   wait_timeout: 20
   login_timeout: 120    # seconds to wait for manual login
 
+test:
+  skip_weeks: 0             # Skip first N weeks (0 = start from first)
+  max_weeks: null           # Process N weeks after skipping (null = all remaining)
+  max_lessons_per_week: null # Limit lessons per week (null = all)
+
 transcription:
-  chunk_length_ms: 600000  # 10 minutes per chunk
+  language: "English"  # Language for video transcript selection on SWAYAM
