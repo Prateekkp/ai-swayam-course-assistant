@@ -3,9 +3,10 @@ from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 
 class SWAYAMBrowser:
@@ -239,30 +240,152 @@ class SWAYAMBrowser:
 
         time.sleep(5)
 
-    def get_youtube_link(self) -> str | None:
+    def select_transcript_language(self, language: str = "English"):
+        print(f"    Selecting transcript language: {language}")
+        time.sleep(2)
+
+        # Find the dropdown trigger button using Selenium (Radix UI needs real click)
         try:
-            link = self.driver.find_elements(
-                By.CSS_SELECTOR,
-                "a.ytmVideoInfoVideoTitle[href*='youtube.com/watch']"
+            trigger = self.wait.until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR,
+                     "#panel-transcript button[data-slot='dropdown-menu-trigger'],"
+                     "#panel-transcript button.hidden")
+                )
             )
-            if link:
-                return link[0].get_attribute("href")
+        except TimeoutException:
+            print("    Could not find language dropdown trigger")
+            return False
 
-            iframe = self.driver.find_elements(By.TAG_NAME, "iframe")
-            if iframe:
-                self.driver.switch_to.frame(iframe[0])
-                time.sleep(2)
-                try:
-                    yt = self.driver.find_elements(
-                        By.XPATH, "//a[contains(@href,'youtube.com/watch')]"
-                    )
-                    if yt:
-                        return yt[0].get_attribute("href")
-                finally:
-                    self._ensure_default_content()
+        current_text = trigger.text.strip().replace("\n", " ")
+        print(f"    Current dropdown text: {current_text}")
 
-            return None
-        except Exception:
-            return None
-        finally:
-            self._ensure_default_content()
+        # If already showing the desired language, skip clicking
+        if language.lower() in current_text.lower() and "select" not in current_text.lower():
+            print(f"    Language already set to {language}")
+            return True
+
+        # Real Selenium click on the dropdown trigger
+        trigger.click()
+        print("    Clicked dropdown trigger, waiting for menu...")
+        time.sleep(2)
+
+        # Find the dropdown menu content (Radix UI renders it in a portal)
+        try:
+            menu_item = self.wait.until(
+                EC.element_to_be_clickable(
+                    (By.XPATH,
+                     f"//div[@data-slot='dropdown-menu-content']//div[@role='menuitem'][normalize-space()='{language}']"
+                     f" | //div[@role='menu']//div[@role='menuitem'][normalize-space()='{language}']"
+                     f" | //*[@data-state='open']//div[@role='menuitem'][normalize-space()='{language}']")
+                )
+            )
+            menu_item.click()
+            print(f"    Clicked language: {language}")
+            time.sleep(5)
+            return True
+        except TimeoutException:
+            print(f"    Menu item '{language}' not found via XPath, trying JavaScript...")
+
+        # Fallback: use JS to click the language option
+        selected = self.driver.execute_script("""
+            const lang = arguments[0];
+            const items = document.querySelectorAll('[role="menuitem"], [data-slot="dropdown-menu-item"]');
+            for (const item of items) {
+                if (item.textContent.trim().toLowerCase() === lang.toLowerCase()) {
+                    item.click();
+                    return true;
+                }
+            }
+            return false;
+        """, language)
+
+        if selected:
+            print(f"    Selected via JS fallback: {language}")
+            time.sleep(5)
+            return True
+
+        print(f"    Could not select language: {language}")
+        return False
+
+    def scrape_transcript(self, language: str = "English") -> str | None:
+        print("    Scraping transcript from page...")
+        self._ensure_default_content()
+        time.sleep(2)
+
+        # Click the Transcript tab if not already active
+        self.driver.execute_script("""
+            const tabs = document.querySelectorAll('button, [role="tab"]');
+            for (const tab of tabs) {
+                if (tab.textContent.trim() === 'Transcript') {
+                    tab.click();
+                    return true;
+                }
+            }
+            return false;
+        """)
+        time.sleep(3)
+
+        # Select language
+        self.select_transcript_language(language)
+
+        # Wait for transcript content to appear
+        time.sleep(3)
+
+        # Extract transcript text from span elements
+        result = self.driver.execute_script("""
+            const panel = document.getElementById('panel-transcript');
+            if (!panel) return {text: null, debug: 'no panel'};
+
+            // Primary: get spans with title="Jump to this part" (transcript segments)
+            let spans = panel.querySelectorAll('span[title="Jump to this part"]');
+            let method = 'title-attr';
+            if (spans.length === 0) {
+                // Fallback: spans with role="button" inside a <p> tag
+                spans = panel.querySelectorAll('p span[role="button"]');
+                method = 'p-span-role';
+            }
+            if (spans.length === 0) {
+                // Fallback: any span with cursor-pointer inside transcript content
+                spans = panel.querySelectorAll('span.cursor-pointer');
+                method = 'cursor-pointer';
+            }
+
+            if (spans.length > 0) {
+                const parts = [];
+                for (const span of spans) {
+                    const text = span.textContent.trim();
+                    if (text) parts.push(text);
+                }
+                return {text: parts.join(' '), debug: method + ':' + spans.length + ' spans'};
+            }
+
+            // Last resort: find the <p> with transcript text
+            const pTags = panel.querySelectorAll('p');
+            for (const p of pTags) {
+                const text = p.innerText.trim();
+                if (text.length > 50) {  // Transcript paragraphs are long
+                    return {text: text, debug: 'p-tag:' + text.length + ' chars'};
+                }
+            }
+
+            // Final fallback: get all text from bg-white div
+            const contentDiv = panel.querySelector('.bg-white');
+            if (contentDiv) {
+                const text = contentDiv.innerText.trim();
+                return {text: text, debug: 'bg-white:' + text.length + ' chars'};
+            }
+
+            return {text: null, debug: 'nothing found, panel HTML length=' + panel.innerHTML.length};
+        """)
+
+        if result and result.get("text") and len(result["text"].strip()) > 15:
+            transcript = result["text"].strip()
+            print(f"    Transcript scraped ({len(transcript)} chars) via {result.get('debug', '?')}")
+            return transcript
+
+        debug_info = result.get("debug", "unknown") if result else "no result"
+        print(f"    No transcript found - debug: {debug_info}")
+        return None
+
+
