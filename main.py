@@ -3,8 +3,7 @@ from pathlib import Path
 
 from swayam.browser import SWAYAMBrowser
 from swayam.scraper import discover_all_lessons, Lesson
-from swayam.downloader import download_audio
-from swayam.transcriber import transcribe_large_audio, save_transcript
+from swayam.transcriber import save_transcript
 from swayam.notes import make_study_notes, save_output
 
 
@@ -21,8 +20,8 @@ def process_lesson(lesson: Lesson, lesson_num: int, output_base: Path, config: d
 
     print(f"\n  Processing: {lesson.lesson_name}")
 
-    if not lesson.youtube_url:
-        print("    Skipped (no YouTube link)")
+    if not lesson.transcript:
+        print("    Skipped (no transcript)")
         return False
 
     study_path = lesson_dir / "study_notes.md"
@@ -34,39 +33,20 @@ def process_lesson(lesson: Lesson, lesson_num: int, output_base: Path, config: d
     lesson_dir.mkdir(parents=True, exist_ok=True)
 
     media_dir = lesson_dir / "media"
-    audio_path = media_dir / "audio.mp3"
     transcript_path = media_dir / "transcript.txt"
     transcript = None
 
-    # Step 1: Get audio (reuse if exists)
-    if audio_path.exists():
-        print("    Audio exists, reusing")
-    else:
-        if config["output"]["save_audio"]:
-            audio_path = download_audio(lesson.youtube_url, media_dir)
-        else:
-            temp_dir = Path("_temp")
-            temp_dir.mkdir(exist_ok=True)
-            audio_path = download_audio(lesson.youtube_url, temp_dir, filename="audio")
-
-    # Step 2: Get transcript (reuse if exists)
+    # Check if we already have a saved transcript
     if transcript_path.exists() and config["output"]["save_transcript"]:
         print("    Transcript exists, reusing")
         transcript = transcript_path.read_text(encoding="utf-8")
     else:
-        chunk_ms = config["transcription"]["chunk_length_ms"]
-        transcript = transcribe_large_audio(audio_path, chunk_length_ms=chunk_ms)
+        transcript = lesson.transcript
         if config["output"]["save_transcript"]:
             save_transcript(transcript, media_dir)
 
-    # Step 3: Generate study notes and MCQs
     notes, mcqs = make_study_notes(transcript, config)
     save_output(notes, mcqs, lesson_dir)
-
-    # Cleanup temp audio if not saving
-    if not config["output"]["save_audio"] and not config["output"].get("keep_temp"):
-        if audio_path.exists() and "_temp" in str(audio_path):
-            audio_path.unlink(missing_ok=True)
 
     return True
 
@@ -87,7 +67,12 @@ def main():
     print("=" * 60)
 
     with SWAYAMBrowser(wait_timeout=wait_timeout, login_timeout=login_timeout) as browser:
-        lessons = discover_all_lessons(browser, course_name)
+        transcript_language = config["transcription"].get("language", "English")
+        test_cfg = config.get("test", {})
+        skip_weeks = test_cfg.get("skip_weeks", 0)
+        max_weeks = test_cfg.get("max_weeks")
+        max_lessons = test_cfg.get("max_lessons_per_week")
+        lessons = discover_all_lessons(browser, course_name, transcript_language, skip_weeks, max_weeks, max_lessons, output_base)
 
     if not lessons:
         print("\nNo lessons found. Exiting.")
