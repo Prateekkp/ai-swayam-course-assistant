@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 from swayam.browser import SWAYAMBrowser
 
-SKIP_KEYWORDS = ["quiz", "practice", "assignment", "subjective", "programming"]
+SKIP_KEYWORDS = ["quiz", "practice", "assignment", "subjective", "programming", "solution"]
 
 
 @dataclass
