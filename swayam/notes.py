@@ -405,6 +405,23 @@ RULES:
     return result[idx:] if idx != -1 else result
 
 
+def format_mcqs_markdown(text: str) -> str:
+    """Ensure MCQ questions, options, and answers have proper 2-space linebreaks."""
+    lines = text.splitlines()
+    formatted = []
+    for line in lines:
+        stripped = line.rstrip()
+        # Option line: e.g. A) ..., B) ... or Question line: e.g. 1. ...
+        if re.match(r"^\s*(\d+[\.\)]|[A-D][\.\)])\s+", stripped):
+            formatted.append(stripped + "  ")
+        # Answer line: add blank line after
+        elif re.match(r"^\s*(\*\*Answer:|Answer:)", stripped, re.IGNORECASE):
+            formatted.append(stripped + "\n")
+        else:
+            formatted.append(line)
+    return "\n".join(formatted)
+
+
 def save_output(notes: str, mcqs: str, output_dir: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -415,7 +432,7 @@ def save_output(notes: str, mcqs: str, output_dir: Path) -> tuple[Path, Path]:
 
     mcqs_path = output_dir / "practice_mcqs.md"
     with open(mcqs_path, "w", encoding="utf-8") as f:
-        f.write(mcqs)
+        f.write(format_mcqs_markdown(mcqs))
     print(f"    Saved: {mcqs_path.name}")
 
     return notes_path, mcqs_path
