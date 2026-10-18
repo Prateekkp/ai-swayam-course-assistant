@@ -5,7 +5,7 @@ swayam:
 llm:
   provider: "nvidia"  # "nvidia" or "groq"
   groq_model: "llama-3.3-70b-versatile"
-  nvidia_model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+  nvidia_model: "nvidia/nemotron-3.5-super-vl-120b-a12b"
 
 output:
   base_dir: "output"

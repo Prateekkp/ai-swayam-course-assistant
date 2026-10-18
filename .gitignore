@@ -6,3 +6,6 @@ output/
 _temp/
 *.mp3
 *.pyc
+output_pdf/
+audit_markdown.py
+pdf.py

@@ -1,7 +1,10 @@
 import os
 import re
 import json
+import time
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -9,8 +12,69 @@ load_dotenv()
 
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-CHUNK_SIZE = 900  # words per chunk
-MAX_RETRIES = 3
+CHUNK_SIZE = 1800  # words per chunk (optimized for 120B context window)
+MAX_RETRIES = 5    # Increased to give multiple retries across keys
+
+_nvidia_key_lock = threading.Lock()
+_nvidia_key_index = 0
+
+REFUSAL_CHECK_PATTERNS = [
+    r"i['’]?m sorry",
+    r"as an ai",
+    r"cannot (generate|create|provide|produce)",
+    r"can['’]?t (generate|create|provide|produce)",
+    r"key points .* empty",
+    r"please (provide|supply)",
+]
+
+
+def get_nvidia_api_keys() -> list[str]:
+    """Retrieve all configured NVIDIA API keys from environment variables."""
+    keys = []
+    # Primary key
+    k1 = os.getenv("NVIDIA_API_KEY")
+    if k1 and k1.strip():
+        keys.append(k1.strip())
+
+    # Additional keys: NVIDIA_API_KEY_2, NVIDIA_API_KEY_3...
+    i = 2
+    while True:
+        k = os.getenv(f"NVIDIA_API_KEY_{i}")
+        if k and k.strip():
+            keys.append(k.strip())
+            i += 1
+        else:
+            break
+
+    # Also support comma-separated NVIDIA_API_KEYS
+    csv_keys = os.getenv("NVIDIA_API_KEYS")
+    if csv_keys:
+        for k in csv_keys.split(","):
+            cleaned = k.strip()
+            if cleaned and cleaned not in keys:
+                keys.append(cleaned)
+
+    return keys
+
+
+def get_base_nvidia_key_index() -> int:
+    """Thread-safe round-robin allocation of the starting key index for a request."""
+    global _nvidia_key_index
+    keys = get_nvidia_api_keys()
+    if not keys:
+        raise ValueError("No NVIDIA API key found. Please set NVIDIA_API_KEY in .env")
+
+    with _nvidia_key_lock:
+        idx = _nvidia_key_index
+        _nvidia_key_index = (_nvidia_key_index + 1) % len(keys)
+        return idx
+
+
+def get_nvidia_key_for_attempt(base_idx: int, attempt: int) -> tuple[str, int, int]:
+    """Retrieve key alternating strictly across retries: (base_idx + attempt) % len(keys)."""
+    keys = get_nvidia_api_keys()
+    idx = (base_idx + attempt) % len(keys)
+    return keys[idx], idx + 1, len(keys)
 
 
 def _call_llm(system_prompt: str, user_content: str, max_tokens: int = 4000, config: dict = None) -> str:
@@ -23,13 +87,9 @@ def _call_llm(system_prompt: str, user_content: str, max_tokens: int = 4000, con
 
 
 def _call_nvidia(system_prompt: str, user_content: str, max_tokens: int, config: dict) -> str:
-    api_key = os.getenv("NVIDIA_API_KEY")
-    model = config.get("llm", {}).get("nvidia_model", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+    model = config.get("llm", {}).get("nvidia_model", "nvidia/nemotron-3.5-super-vl-120b-a12b")
     stream = True
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "text/event-stream" if stream else "application/json",
-    }
+
     payload = {
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -37,37 +97,77 @@ def _call_nvidia(system_prompt: str, user_content: str, max_tokens: int, config:
         ],
         "model": model,
         "max_tokens": max_tokens,
-        "reasoning_budget": 16384,
         "stream": stream,
-        "temperature": 0.6,
+        "temperature": 0.5,
         "top_p": 0.95,
-        "chat_template_kwargs": {"enable_thinking": True},
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
+    last_error = None
+    base_key_idx = get_base_nvidia_key_index()
+
     for attempt in range(MAX_RETRIES):
+        # Pick key strictly alternating: Attempt 0 -> Key 1, Attempt 1 -> Key 2, Attempt 2 -> Key 1, etc.
+        api_key, key_num, total_keys = get_nvidia_key_for_attempt(base_key_idx, attempt)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream" if stream else "application/json",
+        }
+
         try:
             response = requests.post(
                 NVIDIA_URL, headers=headers, json=payload, stream=stream, timeout=120
             )
-            response.raise_for_status()
+
+            # Check HTTP-level errors (429, 401, 500, etc.)
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+
             content = ""
+            stream_error = None
+
             for line in response.iter_lines():
-                if line:
-                    decoded = line.decode("utf-8")
-                    if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                        try:
-                            chunk = json.loads(decoded[6:])
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            if "content" in delta:
+                if not line:
+                    continue
+
+                decoded = line.decode("utf-8")
+                if decoded.startswith("data: ") and decoded != "data: [DONE]":
+                    try:
+                        chunk = json.loads(decoded[6:])
+
+                        # Check for in-stream errors (e.g. ResourceExhausted)
+                        if "error" in chunk:
+                            err_val = chunk["error"]
+                            msg = err_val.get("message", str(err_val)) if isinstance(err_val, dict) else str(err_val)
+                            stream_error = f"In-stream error: {msg}"
+                            break
+
+                        choices = chunk.get("choices")
+                        if choices and len(choices) > 0:
+                            delta = choices[0].get("delta", {})
+                            if "content" in delta and delta["content"]:
                                 content += delta["content"]
-                        except json.JSONDecodeError:
-                            continue
+
+                    except json.JSONDecodeError:
+                        continue
+
+            if stream_error:
+                raise RuntimeError(stream_error)
+
+            if not content.strip():
+                raise RuntimeError("NVIDIA API returned empty content (token limit or silent cutoff).")
+
             return content
-        except requests.exceptions.RequestException as e:
+
+        except Exception as e:
+            last_error = e
+            wait_time = 2 * (attempt + 1)
+            print(f"      [Key {key_num}/{total_keys}] NVIDIA call failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
-                print(f"      NVIDIA API call failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
-                continue
-            raise
+                print(f"      Switching key and waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+
+    raise RuntimeError(f"All {MAX_RETRIES} attempts failed across NVIDIA keys. Last error: {last_error}")
 
 
 def _call_groq(system_prompt: str, user_content: str, max_tokens: int, config: dict) -> str:
@@ -98,6 +198,7 @@ def _call_groq(system_prompt: str, user_content: str, max_tokens: int, config: d
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
                 print(f"      Groq API call failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                time.sleep(2 * (attempt + 1))
                 continue
             raise
 
@@ -153,18 +254,27 @@ RULES:
 - Do NOT add explanations or commentary.
 - Do NOT use emojis."""
 
-    return _call_llm(
+    result = _call_llm(
         system,
         f"Extract key points from this lecture transcript:\n\n{text}",
         max_tokens=2000,
         config=config,
     )
 
+    if not result or len(result.strip()) < 50:
+        raise ValueError("Key points extraction returned empty or insufficient content.")
+
+    return result
+
 
 def merge_key_points(chunk_summaries: list[str]) -> str:
+    valid_summaries = [s for s in chunk_summaries if s and len(s.strip()) > 30]
+    if not valid_summaries:
+        raise ValueError("Cannot merge key points: all chunk summaries were empty.")
+
     merged = "\n\n".join(
         f"### Chunk {i + 1} Key Points\n{summary}"
-        for i, summary in enumerate(chunk_summaries)
+        for i, summary in enumerate(valid_summaries)
     )
     return merged
 
@@ -224,6 +334,15 @@ The output must follow this structure exactly:
         max_tokens=4000,
         config=config,
     )
+
+    if not result or len(result.strip()) < 200:
+        raise ValueError("Generated study notes are empty or too short.")
+
+    # Check for refusal
+    for pat in REFUSAL_CHECK_PATTERNS:
+        if re.search(pat, result[:300], re.IGNORECASE):
+            raise ValueError(f"LLM refusal detected in study notes: {result[:100]}")
+
     idx = result.find("# Study Notes")
     return result[idx:] if idx != -1 else result
 
@@ -273,6 +392,15 @@ RULES:
         max_tokens=4000,
         config=config,
     )
+
+    if not result or len(result.strip()) < 200:
+        raise ValueError("Generated MCQs are empty or too short.")
+
+    # Check for refusal
+    for pat in REFUSAL_CHECK_PATTERNS:
+        if re.search(pat, result[:300], re.IGNORECASE):
+            raise ValueError(f"LLM refusal detected in MCQs: {result[:100]}")
+
     idx = result.find("# Practice MCQs")
     return result[idx:] if idx != -1 else result
 
@@ -293,9 +421,10 @@ def save_output(notes: str, mcqs: str, output_dir: Path) -> tuple[Path, Path]:
     return notes_path, mcqs_path
 
 
-def make_study_notes(transcript_text: str, config: dict) -> str:
+def make_study_notes(transcript_text: str, config: dict) -> tuple[str, str]:
     provider = config.get("llm", {}).get("provider", "groq")
-    print(f"    Using LLM provider: {provider}")
+    keys = get_nvidia_api_keys() if provider == "nvidia" else ["Groq"]
+    print(f"    Using LLM provider: {provider} ({len(keys)} active key(s) configured)")
 
     print("    Chunking transcript...")
     chunks = chunk_transcript(transcript_text)
@@ -306,14 +435,17 @@ def make_study_notes(transcript_text: str, config: dict) -> str:
         print(f"    Extracting key points from chunk {i + 1}/{len(chunks)}...")
         summary = extract_key_points(chunk, config)
         chunk_summaries.append(summary)
+        time.sleep(1.0)  # Gentle spacing between calls to stay within worker slots
 
     print("    Merging key points...")
     merged = merge_key_points(chunk_summaries)
 
-    print("    Generating study notes...")
-    notes = generate_notes(merged, config)
+    print("    Generating study notes & MCQs in parallel (ThreadPoolExecutor)...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_notes = executor.submit(generate_notes, merged, config)
+        future_mcqs = executor.submit(generate_mcqs, merged, config)
 
-    print("    Generating MCQs...")
-    mcqs = generate_mcqs(merged, config)
+        notes = future_notes.result()
+        mcqs = future_mcqs.result()
 
     return notes, mcqs
